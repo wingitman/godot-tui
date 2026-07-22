@@ -1,0 +1,60 @@
+.TH GODOT-TUI 1 "July 2026" "godot-tui" "User Commands"
+.SH NAME
+godot-tui \- keyboard-first terminal interface for Godot 4 projects
+.SH SYNOPSIS
+.B godot-tui
+.RI [ options ]
+.RI [ project-directory ]
+.SH DESCRIPTION
+.B godot-tui
+opens a Godot 4 project in a Bubble Tea terminal interface. With no project
+argument it opens the current working directory. The project argument may be a
+directory or a project.godot file.
+.SH OPTIONS
+.TP
+.BI "-p, --project " PATH
+Open PATH as a project. PATH may be a project directory or project.godot.
+.TP
+.B "-h, --help"
+Display command-line help.
+.TP
+.B "-v, --version"
+Display the build version and injected commit.
+.TP
+.B --config
+Print the active platform-specific configuration path.
+.TP
+.B --ensure-config
+Create the default configuration file if it does not exist, then exit.
+.SH TUI KEYS
+.TP
+.B r
+Run the selected scene.
+.TP
+.B b
+Build/import the project.
+.TP
+.B l
+Open live Godot output.
+.TP
+.B [ / ]
+Cycle the live performance metric view in the bottom dashboard panel while a
+run is active.
+.TP
+.B o
+Open godot.toml in the configured editor and reload it after the editor exits.
+.TP
+.B q
+Quit the interface.
+.SH FILES
+.TP
+.I ~/.config/delbysoft/godot.toml
+Linux configuration path. macOS and Windows use os.UserConfigDir platform
+locations.
+.TP
+.I ~/.config/delbysoft/godot-tui/sessions/
+Default Linux debug session history directory.
+.SH SEE ALSO
+.BR godot (1)
+.SH AUTHOR
+delbysoft
