@@ -16,6 +16,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/wingitman/godot-tui/internal/config"
+	projectexport "github.com/wingitman/godot-tui/internal/export"
 	"github.com/wingitman/godot-tui/internal/godot"
 	"github.com/wingitman/godot-tui/internal/history"
 	"github.com/wingitman/godot-tui/internal/metrics"
@@ -34,6 +35,7 @@ const (
 	ModeError
 	ModeUpdates
 	ModeStats
+	ModeExports
 )
 
 type scene struct {
@@ -105,6 +107,17 @@ type Model struct {
 	lastLogEvent                  map[string]time.Time
 	systemMetrics                 metrics.Snapshot
 	diagnosticStats               map[string]string
+	sceneFilter                   string
+	exportPresets                 []projectexport.Preset
+	exportSelected                map[int]bool
+	exportPaths                   map[int]string
+	exportForm                    string
+	exportFormPreset              int
+	exportDraft                   projectexport.Preset
+	exportQueue                   []projectexport.Preset
+	exportBatchTotal              int
+	exportBatchDone               int
+	exportBatchStarted            time.Time
 }
 
 func New(cfg *config.Config, project string) *Model {
@@ -282,6 +295,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		_ = history.Save(m.cfg, s)
 		history.Prune(m.cfg)
 		m.history = append([]history.Session{s}, m.history...)
+		if m.exportBatchTotal > 0 {
+			m.exportBatchDone++
+		}
+		if len(m.exportQueue) > 0 {
+			m.status = fmt.Sprintf("export %d/%d complete", m.exportBatchDone, m.exportBatchTotal)
+			return m.startNextExport()
+		}
+		if m.exportBatchTotal > 0 {
+			m.status = fmt.Sprintf("exports complete: %d/%d in %s", m.exportBatchDone, m.exportBatchTotal, time.Since(m.exportBatchStarted).Round(time.Second))
+			m.exportBatchTotal = 0
+		}
 		m.mode = ModeLogs
 		return m, nil
 	case reloadMsg:
@@ -312,6 +336,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 	if m.mode == ModeInput {
+		if strings.HasPrefix(m.inputPurpose, "export-choice-") {
+			switch key {
+			case "left", "h", "up", "k":
+				m.cycleExportChoice(-1)
+				return m, nil
+			case "right", "l", "down", "j":
+				m.cycleExportChoice(1)
+				return m, nil
+			case "enter", "esc":
+				// Handled by the shared input controls below.
+			default:
+				return m, nil
+			}
+		}
 		switch key {
 		case "enter":
 			return m.submitInput()
@@ -321,7 +359,13 @@ func (m *Model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.mode = ModeGodotPrompt
 				return m, nil
 			}
-			m.mode = ModeScenes
+			if m.inputPurpose == "scene-filter" {
+				m.mode = ModeScenes
+			} else if strings.HasPrefix(m.inputPurpose, "export-") {
+				m.mode = ModeExports
+			} else {
+				m.mode = ModeScenes
+			}
 			m.input.Blur()
 			return m, nil
 		}
@@ -375,6 +419,9 @@ func (m *Model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.mode == ModeStats {
 		return m, nil
 	}
+	if m.mode == ModeExports {
+		return m.exportKey(key)
+	}
 	if key == m.cfg.Keybinds.Quit || key == "ctrl+c" {
 		if m.run != nil {
 			m.run.Stop()
@@ -383,6 +430,14 @@ func (m *Model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	if key == m.cfg.Keybinds.OpenConfig {
 		return m, m.openConfig()
+	}
+	if m.mode == ModeScenes && (key == m.cfg.Keybinds.Filter || key == "/") {
+		m.inputPurpose = "scene-filter"
+		m.input.Reset()
+		m.input.SetValue(m.sceneFilter)
+		m.input.Placeholder = "scene name or path"
+		m.input.Focus()
+		return m, textinput.Blink
 	}
 	if key == m.cfg.Keybinds.Up {
 		m.cursor--
@@ -450,12 +505,7 @@ func (m *Model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case m.cfg.Keybinds.Build:
 			return m.startRun("build")
 		case m.cfg.Keybinds.Export:
-			m.inputPurpose = "export"
-			m.input.Reset()
-			m.input.Placeholder = "export preset|output path"
-			m.input.Focus()
-			m.mode = ModeInput
-			return m, textinput.Blink
+			return m.openExports()
 		case m.cfg.Keybinds.MainScene:
 			return m.setMainScene()
 		}
@@ -476,19 +526,326 @@ func (m *Model) submitInput() (tea.Model, tea.Cmd) {
 		m.mode = ModeScenes
 		return m, m.discover()
 	}
-	if m.inputPurpose == "export" {
-		p := strings.SplitN(v, "|", 2)
-		if len(p) != 2 {
-			m.err = "Use preset|output path"
-			m.mode = ModeError
-			return m, nil
-		}
+	if m.inputPurpose == "scene-filter" {
+		m.sceneFilter = v
+		m.cursor, m.offset = 0, 0
 		m.inputPurpose = ""
 		m.mode = ModeScenes
-		return m.startRunWith(godot.Operation{Kind: "export", Project: m.project, Preset: strings.TrimSpace(p[0]), Output: strings.TrimSpace(p[1])})
+		m.status = filterStatus(m.sceneFilter, len(m.filteredScenes()))
+		return m, nil
+	}
+	switch m.inputPurpose {
+	case "export-name":
+		if v == "" {
+			return m.inputError("Export name is required")
+		}
+		m.exportDraft.Name = v
+		m.inputPurpose = "export-choice-platform"
+		m.input.Reset()
+		m.input.SetValue(m.exportDraft.Platform)
+		m.input.Placeholder = "use left/right to select a platform"
+		m.input.Focus()
+		return m, textinput.Blink
+	case "export-choice-platform":
+		if v == "" {
+			return m.inputError("Export platform is required")
+		}
+		m.exportDraft.Platform = v
+		m.inputPurpose = "export-choice-filter"
+		m.input.Reset()
+		m.input.SetValue(m.exportDraft.ExportFilter)
+		m.input.Placeholder = "all_resources or resources"
+		m.input.Focus()
+		return m, textinput.Blink
+	case "export-choice-filter":
+		m.exportDraft.ExportFilter = v
+		if v != "all_resources" && v != "resources" {
+			return m.inputError("export filter must be all_resources or resources")
+		}
+		m.inputPurpose = "export-choice-architecture"
+		m.input.Reset()
+		m.input.SetValue(m.exportDraft.Architecture)
+		m.input.Placeholder = "x86_64, x86_32, arm64, or arm32"
+		m.input.Focus()
+		return m, textinput.Blink
+	case "export-choice-architecture":
+		m.exportDraft.Architecture = v
+		check := m.exportDraft
+		if check.Options == nil {
+			check.Options = map[string]string{}
+		}
+		if err := check.Validate(); err != nil {
+			return m.inputError(err.Error())
+		}
+		m.inputPurpose = "export-include"
+		m.input.Reset()
+		m.input.SetValue(m.exportDraft.IncludeFilter)
+		m.input.Placeholder = "include filter (optional)"
+		m.input.Focus()
+		return m, textinput.Blink
+	case "export-include":
+		m.exportDraft.IncludeFilter = v
+		m.inputPurpose = "export-exclude"
+		m.input.Reset()
+		m.input.SetValue(m.exportDraft.ExcludeFilter)
+		m.input.Placeholder = "exclude filter (optional)"
+		m.input.Focus()
+		return m, textinput.Blink
+	case "export-exclude":
+		m.exportDraft.ExcludeFilter = v
+		if err := m.saveExportDraft(); err != nil {
+			return m.inputError(err.Error())
+		}
+		m.inputPurpose = ""
+		m.mode = ModeExports
+		m.exportForm = ""
+		m.status = "export preset saved"
+		return m, nil
+	case "export-output":
+		if v == "" {
+			return m.inputError("Output location is required")
+		}
+		m.exportPaths[m.exportFormPreset] = v
+		if err := projectexport.SavePaths(m.project, m.exportPaths); err != nil {
+			return m.inputError(err.Error())
+		}
+		for i := range m.exportPresets {
+			if m.exportPresets[i].Index == m.exportFormPreset {
+				m.exportPresets[i].Output = v
+			}
+		}
+		m.inputPurpose = ""
+		m.mode = ModeExports
+		m.status = "export location saved"
+		return m, nil
 	}
 	m.mode = ModeScenes
 	return m, nil
+}
+
+func (m *Model) cycleExportChoice(direction int) {
+	values := m.exportChoiceValues()
+	if len(values) == 0 {
+		return
+	}
+	current := m.input.Value()
+	index := -1
+	for i, value := range values {
+		if value == current {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		if direction < 0 {
+			index = len(values) - 1
+		} else {
+			index = 0
+		}
+	} else {
+		index = (index + direction + len(values)) % len(values)
+	}
+	m.input.SetValue(values[index])
+}
+
+func (m *Model) exportChoiceValues() []string {
+	switch m.inputPurpose {
+	case "export-choice-platform":
+		return projectexport.Platforms()
+	case "export-choice-filter":
+		return []string{"all_resources", "resources"}
+	case "export-choice-architecture":
+		return []string{"x86_64", "x86_32", "arm64", "arm32"}
+	default:
+		return nil
+	}
+}
+
+func (m *Model) inputError(message string) (tea.Model, tea.Cmd) {
+	m.err = message
+	m.mode = ModeError
+	return m, nil
+}
+
+func (m *Model) saveExportDraft() error {
+	if m.exportForm == "add" {
+		index := 0
+		for _, p := range m.exportPresets {
+			if p.Index >= index {
+				index = p.Index + 1
+			}
+		}
+		m.exportDraft.Index = index
+		m.exportPresets = append(m.exportPresets, projectexport.Repair(m.exportDraft))
+	} else {
+		for i := range m.exportPresets {
+			if m.exportPresets[i].Index == m.exportFormPreset {
+				m.exportDraft.Index = m.exportFormPreset
+				m.exportPresets[i] = projectexport.Repair(m.exportDraft)
+			}
+		}
+	}
+	return projectexport.Save(m.project, m.exportPresets)
+}
+
+func (m *Model) openExports() (tea.Model, tea.Cmd) {
+	presets, err := projectexport.Load(m.project)
+	if err != nil {
+		return m.inputError(err.Error())
+	}
+	paths, err := projectexport.LoadPaths(m.project)
+	if err != nil {
+		return m.inputError(err.Error())
+	}
+	if len(presets) == 0 {
+		m.err = "No export presets found. Press a to add one."
+	}
+	m.exportPresets = presets
+	m.exportPaths = paths
+	m.exportSelected = map[int]bool{}
+	for i := range m.exportPresets {
+		m.exportPresets[i].Output = paths[m.exportPresets[i].Index]
+		m.exportSelected[m.exportPresets[i].Index] = true
+	}
+	m.cursor, m.offset = 0, 0
+	m.mode = ModeExports
+	return m, nil
+}
+
+func (m *Model) exportKey(key string) (tea.Model, tea.Cmd) {
+	switch key {
+	case "up", "k":
+		m.cursor--
+	case "down", "j":
+		m.cursor++
+	case " ":
+		if len(m.exportPresets) > 0 {
+			p := m.exportPresets[m.cursor]
+			m.exportSelected[p.Index] = !m.exportSelected[p.Index]
+		}
+	case "enter":
+		return m.startExportBatch()
+	case "a":
+		m.status = ""
+		m.err = ""
+		m.exportForm = "add"
+		m.exportDraft = projectexport.New(0, "", "Linux")
+		m.inputPurpose = "export-name"
+		m.input.Reset()
+		m.input.Placeholder = "export preset name"
+		m.input.Focus()
+		m.mode = ModeInput
+		return m, textinput.Blink
+	case "e":
+		if len(m.exportPresets) > 0 {
+			m.status = ""
+			m.err = ""
+			p := m.exportPresets[m.cursor]
+			m.exportForm = "edit"
+			m.exportFormPreset = p.Index
+			m.exportDraft = p
+			m.inputPurpose = "export-name"
+			m.input.Reset()
+			m.input.SetValue(p.Name)
+			m.input.Placeholder = "export preset name"
+			m.input.Focus()
+			m.mode = ModeInput
+			return m, textinput.Blink
+		}
+	case "o":
+		if len(m.exportPresets) > 0 {
+			m.status = ""
+			m.err = ""
+			p := m.exportPresets[m.cursor]
+			m.exportFormPreset = p.Index
+			m.inputPurpose = "export-output"
+			m.input.Reset()
+			m.input.SetValue(p.Output)
+			m.input.Placeholder = "output file or directory"
+			m.input.Focus()
+			m.mode = ModeInput
+			return m, textinput.Blink
+		}
+	case "d":
+		if len(m.exportPresets) > 0 {
+			p := m.exportPresets[m.cursor]
+			presets, err := projectexport.Remove(m.project, p.Index)
+			if err != nil {
+				return m.inputError(err.Error())
+			}
+			delete(m.exportPaths, p.Index)
+			_ = projectexport.SavePaths(m.project, m.exportPaths)
+			m.exportPresets = presets
+			m.cursor = min(m.cursor, len(presets)-1)
+			m.status = "export preset removed"
+		}
+	case "r":
+		if len(m.exportPresets) > 0 {
+			p := projectexport.Repair(m.exportPresets[m.cursor])
+			m.exportPresets[m.cursor] = p
+			if err := projectexport.Save(m.project, m.exportPresets); err != nil {
+				return m.inputError(err.Error())
+			}
+			m.status = "export preset repaired"
+		}
+	case "esc", "left":
+		m.mode = ModeScenes
+		m.cursor, m.offset = 0, 0
+	}
+	m.clamp()
+	return m, nil
+}
+
+func (m *Model) startExportBatch() (tea.Model, tea.Cmd) {
+	if len(m.exportPresets) == 0 {
+		m.status = "no export presets available"
+		return m, nil
+	}
+	m.exportQueue = nil
+	for _, p := range m.exportPresets {
+		if m.exportSelected[p.Index] {
+			if err := p.Validate(); err != nil {
+				m.err = fmt.Sprintf("%s: %s", p.Name, err)
+				m.status = "export blocked"
+				return m, nil
+			}
+			if p.Output == "" {
+				m.exportFormPreset = p.Index
+				m.inputPurpose = "export-output"
+				m.input.Reset()
+				m.input.Placeholder = "output file or directory"
+				m.input.Focus()
+				m.mode = ModeInput
+				return m, textinput.Blink
+			}
+			if err := projectexport.ValidateOutput(m.project, p); err != nil {
+				m.err = fmt.Sprintf("%s: %s", p.Name, err)
+				m.status = "export blocked"
+				return m, nil
+			}
+			if err := projectexport.EnsureOutputParent(m.project, p); err != nil {
+				m.err = fmt.Sprintf("%s: cannot create output directory: %s", p.Name, err)
+				m.status = "export blocked"
+				return m, nil
+			}
+			m.exportQueue = append(m.exportQueue, p)
+		}
+	}
+	if len(m.exportQueue) == 0 {
+		m.status = "select at least one export preset"
+		return m, nil
+	}
+	m.exportBatchTotal = len(m.exportQueue)
+	m.exportBatchDone = 0
+	m.exportBatchStarted = time.Now()
+	return m.startNextExport()
+}
+
+func (m *Model) startNextExport() (tea.Model, tea.Cmd) {
+	p := m.exportQueue[0]
+	m.exportQueue = m.exportQueue[1:]
+	m.status = fmt.Sprintf("exporting %d/%d: %s", m.exportBatchDone+1, m.exportBatchTotal, p.Name)
+	return m.startRunWith(godot.Operation{Kind: "export", Project: m.project, Preset: p.Name, Output: p.Output})
 }
 func (m *Model) createLink() (tea.Model, tea.Cmd) {
 	link := m.cfg.Godot.SymlinkPath
@@ -514,7 +871,8 @@ func (m *Model) createLink() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 func (m *Model) setMainScene() (tea.Model, tea.Cmd) {
-	if len(m.scenes) == 0 {
+	visible := m.filteredScenes()
+	if len(visible) == 0 {
 		return m, nil
 	}
 	path := filepath.Join(m.project, "project.godot")
@@ -524,7 +882,7 @@ func (m *Model) setMainScene() (tea.Model, tea.Cmd) {
 		m.mode = ModeError
 		return m, nil
 	}
-	rel := m.scenes[m.cursor].Path
+	rel := visible[m.cursor].Path
 	lines := strings.Split(string(b), "\n")
 	found := false
 	for i, l := range lines {
@@ -541,7 +899,7 @@ func (m *Model) setMainScene() (tea.Model, tea.Cmd) {
 		m.mode = ModeError
 	} else {
 		for i := range m.scenes {
-			m.scenes[i].Main = i == m.cursor
+			m.scenes[i].Main = m.scenes[i].Path == rel
 		}
 		m.mainScene = rel
 		m.status = "main scene updated"
@@ -550,8 +908,9 @@ func (m *Model) setMainScene() (tea.Model, tea.Cmd) {
 }
 func (m *Model) startRun(kind string) (tea.Model, tea.Cmd) {
 	op := godot.Operation{Kind: kind, Project: m.project}
-	if kind == "run" && len(m.scenes) > 0 {
-		op.Scene = m.scenes[m.cursor].Path
+	visible := m.filteredScenes()
+	if kind == "run" && len(visible) > 0 {
+		op.Scene = visible[m.cursor].Path
 	}
 	return m.startRunWith(op)
 }
@@ -626,9 +985,17 @@ func (m *Model) mouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		m.cursor++
 	case tea.MouseButtonLeft:
 		if msg.Action == tea.MouseActionPress {
-			m.cursor = m.offset + msg.Y - m.listStart()
-			if m.cursor < 0 {
-				m.cursor = 0
+			if m.mode == ModeScenes {
+				start := m.sceneListStart()
+				index := m.offset + msg.Y - start
+				if msg.Y >= start && index >= 0 && index < len(m.filteredScenes()) {
+					m.cursor = index
+				}
+			} else {
+				m.cursor = m.offset + msg.Y - m.listStart()
+				if m.cursor < 0 {
+					m.cursor = 0
+				}
 			}
 		}
 	}
@@ -638,15 +1005,38 @@ func (m *Model) mouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 func (m *Model) count() int {
 	switch m.mode {
 	case ModeScenes:
-		return len(m.scenes)
+		return len(m.filteredScenes())
 	case ModeHistory:
 		return len(m.history)
 	case ModeLogs:
 		return len(m.logLines())
 	case ModeStats:
 		return len(m.stats)
+	case ModeExports:
+		return len(m.exportPresets)
 	}
 	return 0
+}
+
+func (m *Model) filteredScenes() []scene {
+	if m.sceneFilter == "" {
+		return m.scenes
+	}
+	needle := strings.ToLower(m.sceneFilter)
+	filtered := make([]scene, 0, len(m.scenes))
+	for _, s := range m.scenes {
+		if strings.Contains(strings.ToLower(s.Path), needle) {
+			filtered = append(filtered, s)
+		}
+	}
+	return filtered
+}
+
+func filterStatus(filter string, count int) string {
+	if filter == "" {
+		return "filter cleared"
+	}
+	return fmt.Sprintf("filter %q: %d scenes", filter, count)
 }
 func (m *Model) visible() int {
 	n := m.height - 8
@@ -671,6 +1061,17 @@ func (m *Model) clamp() {
 	}
 }
 func (m *Model) listStart() int { return 5 }
+
+func (m *Model) sceneListStart() int {
+	start := 6 // header, separator, panel border, section title, and project path
+	if m.mainScene != "" {
+		start++
+	}
+	if m.sceneFilter != "" {
+		start++
+	}
+	return start
+}
 
 func (m *Model) logLines() []string {
 	width := m.width - 1

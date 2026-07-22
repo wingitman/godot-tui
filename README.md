@@ -63,8 +63,9 @@ man godot-tui
 | arrows | Navigate scenes and lists |
 | `r` | Run selected scene |
 | `b` | Build/import the project |
-| `x` | Export using `preset|output-path` |
+| `x` | Open export preset selection |
 | `m` | Set selected scene as main scene |
+| `/` | Filter scenes by name or path |
 | `l` | Show live logs |
 | `[` / `]` | Cycle the live performance metric view while a run is active |
 | `h` | Show debug history |
@@ -72,6 +73,16 @@ man godot-tui
 | `q` / `Ctrl+C` | Quit |
 
 All keys are configurable in `godot.toml`.
+
+The export screen reads presets from the project's `export_presets.cfg`. Use
+Space to select presets, Enter to export them, `a` to add a preset, `e` to edit
+one, `o` to set its output location, `r` to repair an incomplete preset, and
+`d` to remove it. Preset editing validates the name, platform, export filter,
+architecture, include filter, and exclude filter. Platform, filter, and
+architecture use stacked arrow-key selectors instead of free-text entry. Selected
+presets run sequentially. Output locations are stored in the project-local
+`.godot-tui/export-paths.json` file because Godot receives the output path as a
+command-line argument rather than as part of the preset definition.
 
 ## Configuration
 

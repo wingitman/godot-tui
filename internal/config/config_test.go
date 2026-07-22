@@ -13,6 +13,9 @@ func TestDefaultsExposeRequiredBindings(t *testing.T) {
 	if c.Keybinds.Stats != "s" {
 		t.Fatalf("stats key = %q", c.Keybinds.Stats)
 	}
+	if c.Keybinds.Filter != "/" {
+		t.Fatalf("filter key = %q", c.Keybinds.Filter)
+	}
 	if c.Godot.RequiredMajor != 4 {
 		t.Fatalf("required major = %d", c.Godot.RequiredMajor)
 	}
